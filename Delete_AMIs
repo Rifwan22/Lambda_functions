@@ -1,0 +1,176 @@
+import os
+import boto3
+from botocore.config import Config
+import pandas as pd
+import numpy as np
+import logging
+from datetime import date,datetime, timedelta
+import smtplib
+from email.message import EmailMessage
+import mimetypes
+
+
+#Global vars for network setup
+dry_run = os.environ['DRY_RUN']
+proxy = os.environ['HTTP_PROXY']
+mail_relay = os.environ['MAIL_RELAY']
+proxy_definitions = {
+    'http': proxy,
+    'https': proxy
+}
+
+config_with_proxy = Config(
+   retries = {
+      'max_attempts': 10,
+      'mode': 'standard'
+   },
+   proxies=proxy_definitions
+)
+
+now = date.today()
+
+# Global vars for mail
+
+csv_base_path = '/tmp/'
+os.makedirs(csv_base_path, exist_ok=True)
+file_path = csv_base_path + 'AMIDeleteList-' + str(now) + '.csv'
+
+sender = 'youremail@gmail.com'
+receivers = os.environ['EMAIL_DL'].split(',')
+subject = 'Unwanted Resource Cleanup ' + str(now)
+
+ami_total_count = 0
+html_delete_list = ''
+
+
+# Set the global variables
+globalVars  = dict()
+globalVars['Projects']            = ["US Project"]
+globalVars['Purpose']             = ['DAILY Pipeline']
+
+
+aws_date_fmt='%Y-%m-%dT%H:%M:%S.%fZ'
+script_date_fmt='%Y%m%dT%H%M%S'
+
+deleting_AMI_List = []
+deleting_rds_snapshots_list = []
+
+
+logging.basicConfig(level=logging.INFO)
+
+def ami_cleanup(region):
+    global ami_total_count
+    global html_delete_list
+    logging.info("running ami_cleanup on {0}".format(region))
+
+    ec2Client = boto3.client('ec2',region_name=region)
+    rdsClient = boto3.client('rds',region_name=region)
+
+
+    ami_df= pd.DataFrame(columns=['ami_id','project','days','timestamp','reason'])
+
+
+    response = ec2Client.describe_images(
+                        Filters=[
+                                {
+                                        'Name': 'tag:Project',
+                                        'Values': globalVars['Projects']
+                            }
+
+                        ]
+                    )
+
+
+
+    for ami in response['Images']:
+        ami_id        = ami['ImageId']
+        project       = [tag['Value'] for tag in ami['Tags'] if tag['Key'] == 'Project'][0]
+        date_time_obj = datetime.strptime(ami['CreationDate'],aws_date_fmt)
+        days          =  (datetime.now()-date_time_obj).days
+        timestamp     =  datetime.strftime(date_time_obj,script_date_fmt)
+        ami_df=ami_df.append({"ami_id": ami_id, "project":project, "days":days,"timestamp":timestamp,"reason":"n/a"}, ignore_index=True)
+
+
+
+    ami_def=ami_df.loc[ami_df['Project'].isin(["US Project"])].groupby(['project']).filter(lambda x: len(x) >1).sort_values(['Proje'], ascending=[1,1,1,1,1]).groupby(['Project'], group_keys=False).apply(lambda x: x.head(-1))
+    ami_def=ami_def.assign(reason="More than 1 AMIs")
+
+
+    logging.debug("creating aggregate dataframe of AMIs to be deleted")
+    ami_delete_df=pd.concat([ami_def]).drop_duplicates(subset=['ami_id'], keep='first').reset_index(drop=True)
+
+
+    ami_dict=ami_delete_df.to_dict(orient="records")
+
+
+    logging.info("starting deletion process")
+    for item in ami_dict:
+        try:
+            ami_total_count += 1
+            logging.info("deleting : {0} & {1} - {3},{4},{5},{6} - reason : {2}".format(item['ami_id'], item['project']))
+            print("deleting : {0} & {1} - {3},{4},{5},{6} - reason : {2}".format(item['ami_id'], item['project']))
+            if dry_run:
+                print('Dry RUN')
+            else:
+                print('Not Dry Run')
+                response = ec2Client.deregister_image(ImageId=item['ami_id'])
+                print(response)
+        except:
+            print("error occored wile deleting : {0}-{1}".format(item['ami_id']))
+    logging.info("deletion process complete")
+    logging.info("end of script")
+
+    ami_delete_df.to_csv(file_path)
+
+    html_delete_list = ami_delete_df.to_html()
+
+    year = now.strftime("%Y")
+    print("year:", year)
+
+    month = now.strftime("%m")
+    print("month:", month)
+
+    day = now.strftime("%d")
+    print("day:", day)
+
+def send_email_report():
+
+    mail_body = ''
+    if dry_run:
+        print('Dry RUN')
+        mail_body += '<h1> Dry Run </h2>'
+    mail_body += '<h2>Total of ' + str(ami_total_count) + ' AMIs will be Deleted</h1>'
+    mail_body += '<h3>Find CSV in attachments</h3>'
+    mail_body += html_delete_list
+
+
+    file_name = os.path.basename(file_path)
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = receivers
+    msg.set_content(mail_body,subtype='html')
+
+    ctype, encoding = mimetypes.guess_type(file_path)
+    if ctype is None or encoding is not None:
+        ctype = 'application/octet-stream'
+
+    main_type, sub_type = ctype.split('/', 1)
+    with open(file_path, 'rb') as file:
+        content = file.read()
+        msg.add_attachment(content, maintype=main_type, subtype=sub_type, filename=file_name)
+
+    try:
+       smtp_obj = smtplib.SMTP(mail_relay)
+       smtp_obj.send_message(msg)
+       print("Email sent")
+    except SMTPException:
+       print("Error sending email")
+
+def lambda_handler(event, context):
+    logging.info("running lambda_handler funtion")
+    for region in globalVars['Regions']:
+        ami_cleanup(region)
+        send_email_report()
+    logging.info("finished lambda_handler funtion")
